@@ -1,0 +1,153 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ShadowInformCalc
+#pragma kernel ShadowCast
+#pragma kernel ShadowClear
+#pragma kernel ShadowGauss
+
+#define PI 3.1415926
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float> Shadow;
+Texture2D<float4> Inform;
+RWTexture3D<float4> Ray_Dist_Height_Gradient_Hardness; //三维渲染纹理，x:角度，y:范围，z:光线编号
+StructuredBuffer<float4> LightPos_HeightScale;
+
+//计算遮挡信息
+//x:angle; y:range; z:light;
+[numthreads(8,4,1)]
+void ShadowInformCalc(uint3 id : SV_DispatchThreadID)
+{
+    // 光线坐标/高度偏移系数 == 备注，坐标值xy的分布为[0,1],Z为世界坐标系高度
+    float4 lightPos_HeightScale = LightPos_HeightScale[id.z];
+    // 这个线程负责的角度值
+    float angle = 2 * PI / 1280.0f * (id.x + 1) - PI;
+    float kcos = cos(angle);
+    float ksin = sin(angle);
+    // 这个线程负责的范围起始点
+    float rangeStart = 20 * id.y;
+    //定义全局变量
+    float4 heightTop = float4(0,0,0,0);
+
+	//光源处的信息
+	float4 inforLight = Inform[float2(lightPos_HeightScale.x * 400.0f, lightPos_HeightScale.y * 300.0f)];
+    
+    // 从Inform纹理上采样，计算并返回这一范围内最高的点
+    for (float i = 0; i < 20 ; i++ )
+    {
+		//需要重写的值--世界坐标->相机坐标
+		uint posx = round(kcos * (i + rangeStart) + lightPos_HeightScale.x * 400.0f);
+        uint posy = round(ksin * (i + rangeStart) + lightPos_HeightScale.y * 300.0f);
+        //取值
+		float4 infor = Inform[uint2(posx, posy)];
+		//判断是否为遮挡物
+		float ssh = step(0.2f, infor.y);
+		//判断是不是光源物件本身
+		float sslef = 1 - step(abs(infor.z - inforLight.z), 0.1f) * step( i + rangeStart, 15.0f); //材质不同且距离够远
+        //比较高度
+        float newheight = infor.x * lightPos_HeightScale.w;
+        float s = sslef * ssh * step(heightTop.y , infor.x);
+        //计算射线角度
+		float gradient = atan2(newheight - lightPos_HeightScale.z *  lightPos_HeightScale.w, i + rangeStart) / PI / 2.0f + 0.5f;
+        //写入新值
+		heightTop.x = s * i * 0.05f + heightTop.x * (1 - s); //半径
+		heightTop.y = s * infor.x  + heightTop.y * (1 - s); //高度
+        heightTop.z = s * gradient + heightTop.z * (1 - s); //射线角度
+        heightTop.w = s * (infor.y - 0.4f * infor.z) + heightTop.w * (1 - s); //阴影及遮挡物类型
+    }
+
+    //输出
+	Ray_Dist_Height_Gradient_Hardness[id.xyz] = heightTop;
+}
+
+//利用遮挡信息计算阴影
+//x：ScreenX，y：ScreenY
+[numthreads(8, 4, 1)]
+void ShadowCast(uint3 id : SV_DispatchThreadID)
+{
+	//计算必要信息
+	float4 lightPos_HeightScale = LightPos_HeightScale[id.z];
+	float heightScale = LightPos_HeightScale[id.z].w;
+	float2 posL2 = float2(lightPos_HeightScale.x * 400.0f, lightPos_HeightScale.y * 300.0f);
+	float2 posT2 = float2(id.x, id.y);
+	float angle = atan2(id.y - posL2.y, id.x - posL2.x);
+	//计算像素和光源的距离
+	float dist = distance(posL2, posT2);
+	//计算像素点的高度
+	float4 infor = Inform[id.xy];
+	float height = infor.x * heightScale;
+	
+	
+	//该点角度对应的数组坐标
+	uint a = floor((angle/PI + 1.0f) * 640.0f);
+	float da = (angle / PI + 1.0f) * 640.0f - a;
+
+	float shadow1 = 1;
+	float shadow2 = 1;
+	//遍历数组，求出这个点的阴影值
+	for (uint r = 0; r < 20; r++)
+	{
+		{
+			//取出遮挡信息/距离/高度/角度/软硬
+			float4 R_DHGH = Ray_Dist_Height_Gradient_Hardness[uint3(a, r, id.z)];
+
+			float hTop = R_DHGH.y * heightScale + dist * tan((R_DHGH.z - 0.5f) * 2 * PI);
+			float hTop1 = R_DHGH.y * heightScale;
+			//计算阴影类型
+			float shard = step(0.5f, R_DHGH.w);  //比这个大就是硬阴影
+			float ssoft = step(0.09f, R_DHGH.w) * (1 - shard); //不然还有可能是软阴影
+			//计算覆盖系数
+			float s1 = min(max(hTop1 - height, 0), 1);
+			//如果这个点在计算范围内的话
+			float s2 = step((R_DHGH.x + r) * 20.0f, dist);
+			//如果不是一个类型的遮挡物的话
+			float s3 = step(0.01f, abs(infor.y - infor.z * 0.4f - R_DHGH.w));
+			float s = s1 * s2 * s3;
+			shadow1 = s * min(1 - (shard + 0.5*ssoft), shadow1) + (1 - s) * shadow1;
+		}
+		{
+			//取出遮挡信息/距离/高度/角度/软硬
+			float4 R_DHGH = Ray_Dist_Height_Gradient_Hardness[uint3(a + 1, r, id.z)];
+
+			float hTop = R_DHGH.y * heightScale + dist * tan((R_DHGH.z - 0.5f) * 2 * PI);
+			float hTop1 = R_DHGH.y * heightScale;
+			//计算阴影类型
+			float shard = step(0.5f, R_DHGH.w);  //比这个大就是硬阴影
+			float ssoft = step(0.09f, R_DHGH.w) * (1 - shard); //不然还有可能是软阴影
+															   //计算覆盖系数
+			float s1 = min(max(hTop1 - height, 0), 1);
+			//如果这个点在计算范围内的话
+			float s2 = step((R_DHGH.x + r) * 20.0f, dist);
+			//如果不是一个类型的遮挡物的话
+			float s3 = step(0.01f, abs(infor.y - infor.z * 0.4f - R_DHGH.w));
+			float s = s1 * s2 * s3;
+			shadow2 = s * min(1 - (shard + 0.5*ssoft), shadow2) + (1 - s) * shadow2;
+		}
+	}
+	//计算阴影衰减
+	Shadow[id.xyz] = da*shadow1 + (1 - da)*shadow2;
+}
+
+[numthreads(8, 4, 1)]
+void ShadowClear(uint3 id : SV_DispatchThreadID)
+{
+	Shadow[id.xyz] = 1.0f;
+}
+
+[numthreads(8,4,1)]
+void ShadowGauss(uint3 id : SV_DispatchThreadID)
+{
+	float Gauss[3] = {0.4026f ,0.2442f,0.0545f};
+	float result = 0;
+
+	for(int i = -2;i < 3;i++)
+		for (int j = -2; j < 3; j++)
+		{
+			uint x = abs(i);
+			uint y = abs(j);
+			uint3 coord = uint3(id.x + i, id.y + j, id.z);
+			result += Shadow[coord] * Gauss[x] * Gauss[y];
+		}
+
+	Shadow[id.xyz] = result;
+}
